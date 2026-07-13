@@ -34,6 +34,18 @@ import json
 import sys
 from datetime import datetime
 
+# Mirrors fast_flights.types.Currency's Literal values (extracted from the
+# library's own type hints) — validated here because the library silently
+# echoes back whatever currency you ask for even if Google didn't honor it.
+KNOWN_CURRENCIES = {
+    "ALL", "DZD", "ARS", "AMD", "AWG", "AUD", "AZN", "BSD", "BHD", "BYN", "BMD", "BAM",
+    "BRL", "GBP", "BGN", "CAD", "XPF", "CLP", "CNY", "COP", "CRC", "CUP", "CZK", "DKK",
+    "DOP", "EGP", "EUR", "GEL", "HKD", "HUF", "ISK", "INR", "IDR", "IRR", "ILS", "JMD",
+    "JPY", "JOD", "KZT", "KWD", "LBP", "MKD", "MYR", "MXN", "MDL", "MAD", "TWD", "NZD",
+    "NOK", "OMR", "PKR", "PAB", "PEN", "PHP", "PLN", "QAR", "RON", "RUB", "SAR", "RSD",
+    "SGD", "ZAR", "KRW", "SEK", "CHF", "THB", "TRY", "UAH", "AED", "USD", "VND",
+}
+
 
 def fail(message):
     print(json.dumps({"error": message}))
@@ -49,31 +61,37 @@ def validate_iata(code, flag):
 
 def validate_date(spec, flag):
     try:
-        datetime.strptime(spec, "%Y-%m-%d")
+        return datetime.strptime(spec, "%Y-%m-%d")
     except ValueError:
         fail(
             f"{flag} must be YYYY-MM-DD, got {spec!r} — fast-flights silently misinterprets "
             "malformed dates instead of rejecting them, so this is checked here rather than "
             "left to the library."
         )
-    return spec
 
 
-def parse_window(spec):
+def parse_window(spec, flag):
     if not spec:
         return None
-    start, end = spec.split("-")
-    return (
-        datetime.strptime(start.strip(), "%H:%M").time(),
-        datetime.strptime(end.strip(), "%H:%M").time(),
-    )
+    parts = spec.split("-")
+    if len(parts) != 2:
+        fail(f'{flag} must look like "HH:MM-HH:MM", got {spec!r}')
+    try:
+        start = datetime.strptime(parts[0].strip(), "%H:%M").time()
+        end = datetime.strptime(parts[1].strip(), "%H:%M").time()
+    except ValueError:
+        fail(f'{flag} must look like "HH:MM-HH:MM" with valid 24h times, got {spec!r}')
+    return (start, end)
 
 
 def in_window(t, window):
     if window is None:
         return True
     start, end = window
-    return start <= t <= end
+    if start <= end:
+        return start <= t <= end
+    # window crosses midnight, e.g. "22:00-04:00" for red-eyes
+    return t >= start or t <= end
 
 
 def patch_resilient_parser():
@@ -209,9 +227,27 @@ def main():
     args.to_airport = validate_iata(args.to_airport, "--to")
     if args.from_airport == args.to_airport:
         fail(f"--from and --to are both {args.from_airport!r} — nothing to search")
-    validate_date(args.depart, "--depart")
+
+    depart_dt = validate_date(args.depart, "--depart")
     if args.return_date:
-        validate_date(args.return_date, "--return")
+        return_dt = validate_date(args.return_date, "--return")
+        if return_dt < depart_dt:
+            fail(f"--return ({args.return_date}) is before --depart ({args.depart})")
+
+    if not (1 <= args.adults <= 9):
+        fail(f"--adults must be 1-9 (Google Flights' own UI cap), got {args.adults}")
+    if args.limit < 1:
+        fail(f"--limit must be >= 1, got {args.limit}")
+    if args.max_stops is not None and args.max_stops < 0:
+        fail(f"--max-stops must be >= 0, got {args.max_stops}")
+    if args.currency:
+        args.currency = args.currency.strip().upper()
+        if args.currency not in KNOWN_CURRENCIES:
+            fail(
+                f"--currency {args.currency!r} isn't a currency fast-flights recognizes. "
+                "The library would silently echo it back on the price label even if Google "
+                "priced in something else — rejecting instead of risking a mislabeled price."
+            )
 
     try:
         import fast_flights as ff
@@ -261,8 +297,8 @@ def main():
         )
         sys.exit(1)
 
-    depart_window = parse_window(args.depart_window)
-    arrive_window = parse_window(args.arrive_window)
+    depart_window = parse_window(args.depart_window, "--depart-window")
+    arrive_window = parse_window(args.arrive_window, "--arrive-window")
 
     rows = []
     skipped = getattr(result, "parse_skipped", 0)

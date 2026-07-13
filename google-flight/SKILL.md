@@ -37,22 +37,28 @@ installed afterward. Battery included.
 
 Key flags:
 
-- `--from` / `--to` — IATA airport codes (e.g. `TPE`, `MAD`)
-- `--depart YYYY-MM-DD` — required
-- `--return YYYY-MM-DD` — omit for one-way
-- `--currency` — e.g. `TWD`, `USD` (blank lets Google pick)
+- `--from` / `--to` — IATA airport codes (e.g. `TPE`, `MAD`), validated as
+  3 letters and case-normalized; must differ from each other
+- `--depart YYYY-MM-DD` — required, strictly validated (see Lessons #6)
+- `--return YYYY-MM-DD` — omit for one-way; must not be before `--depart`
+- `--adults` — 1-9 (Google Flights' own UI cap), default 1
+- `--currency` — e.g. `TWD`, `USD` (blank lets Google pick); validated
+  against the ~70 codes fast-flights actually supports
 - `--max-stops N` — filters client-side (the library's own server-side stop
-  filter crashes the parser on some routes, see below — don't pass it upstream)
+  filter crashes the parser on some routes, see below — don't pass it
+  upstream); must be >= 0
 - `--depart-window "HH:MM-HH:MM"` / `--arrive-window "HH:MM-HH:MM"` — filter
   the outbound leg's clock-time departure/arrival, e.g. `--arrive-window
-  "12:00-18:00"` for "must land in the afternoon"
+  "12:00-18:00"` for "must land in the afternoon". Supports windows that
+  cross midnight, e.g. `"22:00-04:00"` for red-eyes.
 - `--format json|table` — `json` for another agent/script to consume,
   `table` for a human to read
-- `--limit N` — cap results (sorted by price ascending)
+- `--limit N` — cap results (sorted by price ascending), must be >= 1
 
-On success it exits 0 and prints results. On failure (no results, or the
-upstream parser choking) it prints a JSON `{"error": ...}` to stderr/stdout
-and exits non-zero — check the exit code, don't just check stdout is non-empty.
+On success it exits 0 and prints results. On failure (bad input, no results,
+or the upstream parser choking) it prints a JSON `{"error": ...}` to
+stdout/stderr and exits non-zero — check the exit code, don't just check
+stdout is non-empty.
 
 ## Lessons this distills (from manually driving Google Flights in a real browser first)
 
@@ -115,6 +121,38 @@ and exits non-zero — check the exit code, don't just check stdout is non-empty
    validates `--depart`/`--return` as strict `YYYY-MM-DD` and `--from`/`--to`
    as 3-letter codes *before* calling into the library, specifically because
    the library won't catch this class of error for you.
+7. **A wide fuzz/stress pass caught more of the same pattern — silent
+   nonsense accepted, or a clean crash for a case that should be a one-line
+   input error.** Swept ~90 more combinations: 24 non-TPE routes spanning
+   every continent (round-trip, `avg ~1.6s`), plus deliberately bad input.
+   Findings, now all fixed with upfront validation instead of relying on the
+   library:
+   - `--adults 0` silently returned real results for a booking with nobody
+     on it; `--adults -1` and `--adults 50` both raised an uncaught
+     exception deep inside the library instead of a clean error. Now
+     rejected upfront: must be 1-9 (Google's own UI cap).
+   - `--depart-window`/`--arrive-window` with no `-`, an out-of-range hour
+     (`25:00-26:00`), or plain garbage all raised an unhandled
+     `ValueError`/traceback from inside `parse_window`. Now caught and
+     reported as a clean input error.
+   - A window that crosses midnight (`22:00-04:00`, for red-eyes) used to
+     silently match nothing, because `in_window` only checked
+     `start <= t <= end` — impossible when `start > end`. Fixed: `in_window`
+     now special-cases `start > end` as a wraparound window.
+   - `--return` dated before `--depart` was silently accepted and searched
+     anyway. Now rejected with a clear ordering error.
+   - A `--currency` value fast-flights doesn't recognize (e.g. a typo like
+     `XXX`) was silently echoed back as the result's currency label even
+     though Google may have priced in something else entirely — a
+     mislabeled-price risk, not just a cosmetic one. Now validated against
+     the ~70 currency codes the library actually supports.
+   - Negative/zero `--limit` and negative `--max-stops` produced confusing
+     but "successful" output (e.g. `--limit -1` silently returned all-but-
+     the-last row via Python slice semantics) instead of telling you the
+     input didn't make sense. Now rejected upfront.
+   - Three determinism runs of the identical query back-to-back returned
+     identical prices — the "deterministic" claim holds for same-session,
+     back-to-back calls; it's cross-session/day drift (point 5) that varies.
 
 ## Files
 
