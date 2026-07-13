@@ -40,20 +40,32 @@ jobs:
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           TAG="v0.1.0-${SHORT_SHA}"
-          cat > release-notes.md <<EOF
-          ## google-flight skill
 
-          **Version:** \`${SHORT_SHA}\`
-          **Commit:** ${GITHUB_SHA}
+          # Pull the commit message into the notes so releases carry a real
+          # changelog instead of just version/install boilerplate. Written
+          # via redirection (not heredoc variable interpolation) so nothing
+          # in the commit message can be reinterpreted by the shell.
+          git log -1 --pretty=%B > /tmp/commit-body.txt
 
-          ### Install
+          {
+            echo "## What changed"
+            echo
+            cat /tmp/commit-body.txt
+            echo
+            echo "---"
+            echo
+            echo "**Version:** \`${SHORT_SHA}\`"
+            echo "**Commit:** ${GITHUB_SHA}"
+            echo
+            echo "### Install"
+            echo
+            echo '```bash'
+            echo "npx skills add htlin222/google-flight-skill"
+            echo '```'
+            echo
+            echo "Or download the \`.skill\` file from assets below."
+          } > release-notes.md
 
-          \`\`\`bash
-          npx skills add htlin222/google-flight-skill
-          \`\`\`
-
-          Or download the \`.skill\` file from assets below.
-          EOF
           gh release create "${TAG}" \
             --title "google-flight skill ${TAG}" \
             --notes-file release-notes.md \
