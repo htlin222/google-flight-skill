@@ -35,6 +35,30 @@ import sys
 from datetime import datetime
 
 
+def fail(message):
+    print(json.dumps({"error": message}))
+    sys.exit(1)
+
+
+def validate_iata(code, flag):
+    code = code.strip().upper()
+    if len(code) != 3 or not code.isalpha():
+        fail(f"{flag} must be a 3-letter IATA airport code, got {code!r}")
+    return code
+
+
+def validate_date(spec, flag):
+    try:
+        datetime.strptime(spec, "%Y-%m-%d")
+    except ValueError:
+        fail(
+            f"{flag} must be YYYY-MM-DD, got {spec!r} — fast-flights silently misinterprets "
+            "malformed dates instead of rejecting them, so this is checked here rather than "
+            "left to the library."
+        )
+    return spec
+
+
 def parse_window(spec):
     if not spec:
         return None
@@ -50,6 +74,94 @@ def in_window(t, window):
         return True
     start, end = window
     return start <= t <= end
+
+
+def patch_resilient_parser():
+    """Monkey-patch fast_flights' HTML/JSON parser to skip malformed result
+    entries instead of aborting the whole parse.
+
+    Root cause (found by sweeping ~20 routes): fast_flights.parser.parse_js
+    does `price = k[1][0][1]` for every raw itinerary entry `k` in Google's
+    payload, with no bounds check. Some entries (observed on TPE-LHR,
+    TPE-BNE, TPE-JNB, and intermittently others) have no price data in that
+    slot, and that one bad entry throws IndexError for the *entire* result
+    set — even when the payload also contains other, perfectly good entries.
+
+    This re-implements parse_js with the same per-entry logic, but wraps
+    each entry in try/except and skips just that one instead of the whole
+    response. If fast_flights changes its internal parser shape in a future
+    release, this patch fails closed: the try/except below falls back to
+    the library's own (unpatched) behavior rather than raising here.
+    """
+    try:
+        import json as _json
+
+        import fast_flights.parser as _parser
+        from fast_flights.exceptions import FlightsNotFound
+        from fast_flights.model import (
+            Airline,
+            Airport,
+            Alliance,
+            CarbonEmission,
+            Flights,
+            JsMetadata,
+            SimpleDatetime,
+            SingleFlight,
+        )
+
+        def resilient_parse_js(js):
+            data = js.split("data:", 1)[1].rsplit(",", 1)[0]
+            if data.endswith("errorHasStatus: true"):
+                raise FlightsNotFound("no flights found; received error")
+            payload = _json.loads(data)
+
+            alliances, airlines_meta = [], []
+            alliances_data, airlines_data = payload[7][1][0], payload[7][1][1]
+            for code, name in alliances_data:
+                alliances.append(Alliance(code=code, name=name))
+            for code, name in airlines_data:
+                airlines_meta.append(Airline(code=code, name=name))
+            meta = JsMetadata(alliances=alliances, airlines=airlines_meta)
+
+            flights = _parser.ResultList()
+            skipped = 0
+            if payload[3][0] is not None:
+                for k in payload[3][0]:
+                    try:
+                        flight = k[0]
+                        price = k[1][0][1]
+                        sg_flights = [
+                            SingleFlight(
+                                from_airport=Airport(code=sf[3], name=sf[4]),
+                                to_airport=Airport(code=sf[6], name=sf[5]),
+                                departure=SimpleDatetime(date=sf[20], time=sf[8]),
+                                arrival=SimpleDatetime(date=sf[21], time=sf[10]),
+                                duration=sf[11],
+                                plane_type=sf[17],
+                            )
+                            for sf in flight[2]
+                        ]
+                        extras = flight[22]
+                        flights.append(
+                            Flights(
+                                type=flight[0],
+                                price=price,
+                                airlines=flight[1],
+                                flights=sg_flights,
+                                carbon=CarbonEmission(typical_on_route=extras[8], emission=extras[7]),
+                            )
+                        )
+                    except (IndexError, TypeError, KeyError):
+                        skipped += 1
+                        continue
+
+            flights.metadata = meta
+            flights.parse_skipped = skipped
+            return flights
+
+        _parser.parse_js = resilient_parse_js
+    except Exception as e:
+        print(f"note: resilient-parser patch didn't apply ({type(e).__name__}: {e}); using stock fast_flights", file=sys.stderr)
 
 
 class IncompleteLegData(Exception):
@@ -93,6 +205,14 @@ def main():
     ap.add_argument("--format", choices=["json", "table"], default="table")
     args = ap.parse_args()
 
+    args.from_airport = validate_iata(args.from_airport, "--from")
+    args.to_airport = validate_iata(args.to_airport, "--to")
+    if args.from_airport == args.to_airport:
+        fail(f"--from and --to are both {args.from_airport!r} — nothing to search")
+    validate_date(args.depart, "--depart")
+    if args.return_date:
+        validate_date(args.return_date, "--return")
+
     try:
         import fast_flights as ff
     except ImportError:
@@ -101,6 +221,8 @@ def main():
             file=sys.stderr,
         )
         sys.exit(2)
+
+    patch_resilient_parser()
 
     flights = [ff.FlightQuery(date=args.depart, from_airport=args.from_airport, to_airport=args.to_airport)]
     trip = "one-way"
@@ -127,9 +249,11 @@ def main():
                 {
                     "error": f"{type(e).__name__}: {e}",
                     "note": (
-                        "fast-flights' parser broke on this route's response shape. "
-                        "This happens on some multi-stop long-haul itineraries. "
-                        "Fall back to a real-browser tool (e.g. kimi-webbridge) for this query."
+                        "fast-flights couldn't parse Google's response for this query. "
+                        "--from/--to passed format validation but might not be a real/servable "
+                        "airport code, or this hit a still-unresolved parser edge case. "
+                        "Double-check the airport codes, then fall back to a real-browser tool "
+                        "(e.g. kimi-webbridge) if the route is definitely valid."
                     ),
                 }
             ),
@@ -141,7 +265,7 @@ def main():
     arrive_window = parse_window(args.arrive_window)
 
     rows = []
-    skipped = 0
+    skipped = getattr(result, "parse_skipped", 0)
     for f in result:
         # fast-flights' round-trip response only ever populates the outbound
         # itinerary here (see module docstring) — treat all legs as one leg

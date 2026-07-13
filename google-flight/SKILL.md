@@ -70,23 +70,32 @@ and exits non-zero — check the exit code, don't just check stdout is non-empty
    flight isn't resolved. If you need the actual return time pinned down,
    treat this script's price as a first-pass estimate and confirm the return
    leg with a browser tool.
-3. **The reverse-engineered parser is fragile, in two different ways.** It
-   decodes an undocumented, unstable `tfs` protobuf param and parses embedded
-   JSON that Google can reshape at any time.
-   - *Whole-query failure*: `ff.get_flights()` itself raises
-     (`IndexError`/`TypeError` inside `fast_flights.parser`) on some
-     multi-stop long-haul itineraries — TPE→MAD one-way hits this every time
-     in testing. This script catches it around the API call and reports a
-     clean error instead of a stack trace.
-   - *Per-result failure*: the call succeeds, but one specific result in the
-     list has its leg date/time left as `None` by Google's payload — seen on
-     TPE→SYD and TPE→BNE. This doesn't raise inside `get_flights()`, it blows
-     up later while formatting that one result. The script now catches this
-     per-row (`IncompleteLegData`), drops just that malformed result, and
-     reports how many were dropped — a route returning 5 good results and
-     skipping 1 bad one is normal, not a sign something's broken.
-   Either way: a caught error means "fall back to a browser tool for this
-   specific query," not "the route has no flights."
+3. **The reverse-engineered parser is fragile, in two different ways —
+   and one of them was fixable.** It decodes an undocumented, unstable `tfs`
+   protobuf param and parses embedded JSON that Google can reshape at any
+   time.
+   - *Whole-query failure, root-caused and patched*: a sweep of ~20 routes
+     found `fast_flights.parser.parse_js` does `price = k[1][0][1]` for
+     every raw itinerary entry with no bounds check — one entry missing
+     price data (common on TPE→LHR, TPE→BNE, TPE→JNB, and intermittently
+     others) crashed the parse for the *entire* result set, discarding every
+     other good entry along with it. That was a fixable bug in a 15-line
+     loop, not an inherent fragility, so this script monkey-patches
+     `parse_js` at import time (see `patch_resilient_parser()`) to skip only
+     the bad entry and keep the rest. Pass rate on the swept routes went
+     from 33/40 to 40/40 after the patch. If a future `fast-flights` release
+     changes the parser's internal shape, the patch fails closed (falls back
+     to stock behavior with a stderr note) rather than breaking the script.
+   - *Per-result failure*: even with the patch, one specific result can
+     still have its leg date/time left as `None` by Google's payload — seen
+     on TPE→SYD. This isn't a parse crash, it blows up later while
+     formatting that one result. The script catches this per-row
+     (`IncompleteLegData`), drops just that malformed result, and reports
+     how many were dropped — a route returning 5 good results and skipping
+     1 bad one is normal, not a sign something's broken.
+   A caught error now means "this specific route/date is still unresolvable
+   after the patch," not "the library is generally unreliable" — treat it as
+   fall back to a browser tool for that one query.
 4. **Don't trust server-side `max_stops`.** Passing it into the upstream
    query crashes the parser outright on some routes (empirical finding, not
    documented upstream). This script filters stops client-side instead —
@@ -97,6 +106,15 @@ and exits non-zero — check the exit code, don't just check stdout is non-empty
    don't be surprised if a browser session run seconds later shows a
    different cheapest option. For anything price-sensitive, sample both and
    take the lower bound as your target, not either single number as gospel.
+6. **A malformed `--depart`/`--return` fails silently, not loudly — validate
+   it yourself.** Passing `15-09-2026` (an unambiguous non-ISO string) to
+   `fast_flights.FlightQuery` didn't raise; it silently resolved to
+   `2026-09-09` and returned real, plausible-looking results for the *wrong
+   date*, with nothing in the output signaling anything was off. This is far
+   more dangerous than a crash — a crash gets noticed. This script now
+   validates `--depart`/`--return` as strict `YYYY-MM-DD` and `--from`/`--to`
+   as 3-letter codes *before* calling into the library, specifically because
+   the library won't catch this class of error for you.
 
 ## Files
 
