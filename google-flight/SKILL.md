@@ -70,15 +70,23 @@ and exits non-zero — check the exit code, don't just check stdout is non-empty
    flight isn't resolved. If you need the actual return time pinned down,
    treat this script's price as a first-pass estimate and confirm the return
    leg with a browser tool.
-3. **The reverse-engineered parser is fragile.** It decodes an undocumented,
-   unstable `tfs` protobuf param and parses embedded JSON that Google can
-   reshape at any time. It reliably breaks (`IndexError`/`TypeError` inside
-   `fast_flights.parser`) on some multi-stop long-haul itineraries — TPE→MAD
-   one-way hits this every time in testing, while TPE→MAD round-trip and
-   TPE→NRT one-way both work fine. This script catches those exceptions and
-   reports them cleanly instead of crashing; treat a caught error as "fall
-   back to a browser tool for this specific query," not as "the route has no
-   flights."
+3. **The reverse-engineered parser is fragile, in two different ways.** It
+   decodes an undocumented, unstable `tfs` protobuf param and parses embedded
+   JSON that Google can reshape at any time.
+   - *Whole-query failure*: `ff.get_flights()` itself raises
+     (`IndexError`/`TypeError` inside `fast_flights.parser`) on some
+     multi-stop long-haul itineraries — TPE→MAD one-way hits this every time
+     in testing. This script catches it around the API call and reports a
+     clean error instead of a stack trace.
+   - *Per-result failure*: the call succeeds, but one specific result in the
+     list has its leg date/time left as `None` by Google's payload — seen on
+     TPE→SYD and TPE→BNE. This doesn't raise inside `get_flights()`, it blows
+     up later while formatting that one result. The script now catches this
+     per-row (`IncompleteLegData`), drops just that malformed result, and
+     reports how many were dropped — a route returning 5 good results and
+     skipping 1 bad one is normal, not a sign something's broken.
+   Either way: a caught error means "fall back to a browser tool for this
+   specific query," not "the route has no flights."
 4. **Don't trust server-side `max_stops`.** Passing it into the upstream
    query crashes the parser outright on some routes (empirical finding, not
    documented upstream). This script filters stops client-side instead —

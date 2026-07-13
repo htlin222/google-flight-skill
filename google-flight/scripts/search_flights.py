@@ -52,13 +52,27 @@ def in_window(t, window):
     return start <= t <= end
 
 
+class IncompleteLegData(Exception):
+    """Raised when Google's payload left a leg's date/time fields as None.
+
+    Observed on some long-haul routes (e.g. TPE-SYD) where fast-flights'
+    parser successfully returns a Flights object but one of its legs has
+    unresolved timing data. Callers should skip the offending result rather
+    than crash the whole run.
+    """
+
+
 def to_time(simple_dt):
-    h = simple_dt.time[0]
-    m = simple_dt.time[1] if len(simple_dt.time) > 1 else 0
+    h = simple_dt.time[0] if simple_dt.time else None
+    m = simple_dt.time[1] if simple_dt.time and len(simple_dt.time) > 1 else 0
+    if h is None:
+        raise IncompleteLegData("missing departure/arrival hour")
     return datetime.strptime(f"{h:02d}:{m:02d}", "%H:%M").time()
 
 
 def to_date_str(simple_dt):
+    if not simple_dt.date or any(part is None for part in simple_dt.date):
+        raise IncompleteLegData("missing date")
     y, mo, d = simple_dt.date
     return f"{y:04d}-{mo:02d}-{d:02d}"
 
@@ -127,6 +141,7 @@ def main():
     arrive_window = parse_window(args.arrive_window)
 
     rows = []
+    skipped = 0
     for f in result:
         # fast-flights' round-trip response only ever populates the outbound
         # itinerary here (see module docstring) — treat all legs as one leg
@@ -135,8 +150,17 @@ def main():
         if not outbound_legs or outbound_legs[-1].to_airport.code != args.to_airport:
             continue
 
-        first_dep = to_time(outbound_legs[0].departure)
-        last_arr = to_time(outbound_legs[-1].arrival)
+        try:
+            first_dep = to_time(outbound_legs[0].departure)
+            last_arr = to_time(outbound_legs[-1].arrival)
+            depart_str = f"{to_date_str(outbound_legs[0].departure)} {first_dep}"
+            arrive_str = f"{to_date_str(outbound_legs[-1].arrival)} {last_arr}"
+        except IncompleteLegData:
+            # Google's payload left this one result's timing unresolved.
+            # Skip it rather than crash the whole search — see SKILL.md.
+            skipped += 1
+            continue
+
         stops = len(outbound_legs) - 1
 
         if args.max_stops is not None and stops > args.max_stops:
@@ -152,8 +176,8 @@ def main():
                 "currency": args.currency or "default",
                 "airlines": f.airlines,
                 "stops": stops,
-                "depart": f"{to_date_str(outbound_legs[0].departure)} {first_dep}",
-                "arrive": f"{to_date_str(outbound_legs[-1].arrival)} {last_arr}",
+                "depart": depart_str,
+                "arrive": arrive_str,
                 "duration_min": sum(leg.duration for leg in outbound_legs),
                 "route": " -> ".join(
                     [outbound_legs[0].from_airport.code] + [leg.to_airport.code for leg in outbound_legs]
@@ -165,11 +189,19 @@ def main():
     rows = rows[: args.limit]
 
     if not rows:
-        print(json.dumps({"error": "no results matched the given filters", "trip": trip}))
+        print(
+            json.dumps(
+                {
+                    "error": "no results matched the given filters",
+                    "trip": trip,
+                    "skipped_incomplete": skipped,
+                }
+            )
+        )
         sys.exit(1)
 
     if args.format == "json":
-        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        print(json.dumps({"results": rows, "skipped_incomplete": skipped}, ensure_ascii=False, indent=2))
     else:
         widths = [8, 6, 30, 6, 20, 20, 10]
         header = ["PRICE", "STOPS", "AIRLINES", "DUR(m)", "DEPART", "ARRIVE", "ROUTE"]
@@ -198,6 +230,12 @@ def main():
                 "This library returns outbound options + total price in one call, mirroring "
                 "Google Flights' own two-step UI (pick outbound, then see return options) — "
                 "it does not resolve which specific return flight is paired with the total."
+            )
+        if skipped:
+            print(
+                f"\n{skipped} result(s) omitted: Google's payload left their timing data "
+                "unresolved (seen on some long-haul routes, e.g. TPE-SYD). Not a sign the "
+                "route has no flights — just that those specific results couldn't be parsed."
             )
 
 
